@@ -1,3 +1,5 @@
+*Русский · [English version](README.en.md)*
+
 # claude-statusline
 
 Статусная строка для [Claude Code](https://claude.com/claude-code): две строки, разбитые
@@ -39,7 +41,7 @@
 Требуется `python3` — больше ничего, все зависимости стандартная библиотека.
 
 ```bash
-git clone git@github.com:<ваш-логин>/claude-statusline.git
+git clone git@github.com:UIbodulloev/claude-statusline.git
 cp claude-statusline/statusline.py claude-statusline/statusline-command.sh ~/.claude/
 chmod +x ~/.claude/statusline-command.sh
 ```
