@@ -24,6 +24,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -53,6 +54,9 @@ C_FREE = fg(75, 80, 90)        # тёмно-серый — свободное м
 BAR_W = 20                     # бары лимитов 5h / 7d
 CTX_BAR_W = 30                 # бар контекста
 SEP = "     "
+COMPACT_LIMIT = 3              # после стольких /compact подряд — предупреждение
+
+COMPACT_RE = re.compile(r'"isCompactSummary"\s*:\s*true')
 
 CACHE_DIR = os.path.expanduser("~/.claude/cache")
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
@@ -227,6 +231,68 @@ def baseline_tokens(transcript_path, session_id):
     return base
 
 
+def compact_count(transcript_path, session_id):
+    """Сколько раз сессия уже прошла через /compact (или автокомпакт).
+
+    Транскрипт растёт на каждый ответ, а компактов в нём немного, поэтому
+    досчитываем только новый хвост с прошлого вызова — офсет и накопленный
+    счётчик лежат в кэше, полный файл каждый раз не перечитываем.
+    """
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None
+    cache_file = os.path.join(CACHE_DIR, f"statusline-compact-{session_id or 'x'}")
+    count, offset = 0, 0
+    try:
+        with open(cache_file) as fh:
+            count_s, offset_s = fh.read().strip().split(":")
+            count, offset = int(count_s), int(offset_s)
+    except Exception:
+        count, offset = 0, 0
+    try:
+        if os.path.getsize(transcript_path) < offset:   # файл пересоздан
+            count, offset = 0, 0
+        with open(transcript_path, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read().decode("utf-8", errors="replace")
+            count += len(COMPACT_RE.findall(chunk))
+            offset = fh.tell()
+    except Exception:
+        return count or None
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cache_file, "w") as fh:
+            fh.write(f"{count}:{offset}")
+    except Exception:
+        pass
+    return count
+
+
+def warn_compact_limit(session_id, count):
+    """Разово пуляет системное уведомление+звук, когда компактов набралось COMPACT_LIMIT."""
+    if count is None or count < COMPACT_LIMIT:
+        return
+    sentinel = os.path.join(CACHE_DIR, f"statusline-compact-warned-{session_id or 'x'}")
+    if os.path.exists(sentinel):
+        return
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        open(sentinel, "w").close()
+    except Exception:
+        pass
+    tone = ("/System/Library/PrivateFrameworks/ToneLibrary.framework"
+            "/Versions/A/Resources/AlertTones/Classic/Tri-Tone.m4r")
+    try:
+        subprocess.Popen(
+            ["osascript", "-e",
+             f'display notification "Уже {count}/{COMPACT_LIMIT} автокомпакта — '
+             'лучше сделать /clear" with title "Claude Code"'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["afplay", tone],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def stacked_ctx(base, history, limit):
     """Бар на весь порог автокомпакта: base | hist | free + его расшифровка."""
     used = base + history
@@ -275,7 +341,7 @@ def main():
 
     # --- проект / модель ---
     proj = (data.get("workspace") or {}).get("project_dir") or data.get("cwd") or ""
-    top = f"📁 {C_PROJECT}{BOLD}{os.path.basename(proj)}{R}" if proj else ""
+    top = f"{C_PROJECT}{BOLD}{os.path.basename(proj)}{R}" if proj else ""
 
     model = (data.get("model") or {}).get("display_name")
     bottom = ""
@@ -283,7 +349,7 @@ def main():
         tags = [t for t in (fmt_window(cw.get("context_window_size")),
                             (data.get("effort") or {}).get("level"),
                             "fast" if data.get("fast_mode") else None) if t]
-        bottom = f"⚡ {C_MODEL}{model_name(model)}{R}"
+        bottom = f"{C_MODEL}{model_name(model)}{R}"
         if tags:
             bottom += f" {C_GREY}({' · '.join(tags)}){R}"
     if top or bottom:
@@ -292,20 +358,20 @@ def main():
     # --- лимиты: 5h сверху, 7d снизу ---
     rl = data.get("rate_limits") or {}
 
-    def limit_cell(key, icon, label):
+    def limit_cell(key, label):
         win = rl.get(key) or {}
         upct = win.get("used_percentage")
         if upct is None:
             return ""
-        cell = (f"{icon} {C_GREY}{label}{R} {bar(upct)} "
+        cell = (f"{C_GREY}{label}{R} {bar(upct)} "
                 f"{usage_color(upct)}{BOLD}{upct:.0f}%{R}")
         rem = fmt_remaining(win.get("resets_at"))
         if rem:
             cell += f" {C_GREY}({R}{C_TIME}{rem}{R}{C_GREY}){R}"
         return cell
 
-    top = limit_cell("five_hour", "⏳", "5h")
-    bottom = limit_cell("seven_day", "📅", "7d")
+    top = limit_cell("five_hour", "5h")
+    bottom = limit_cell("seven_day", "7d")
     if top or bottom:
         columns.append((top, bottom))
 
@@ -317,15 +383,22 @@ def main():
         base = min(int(baseline_tokens(data.get("transcript_path"),
                                        data.get("session_id")) or 0), int(total_in))
         bar_s, items = stacked_ctx(base, max(int(total_in) - base, 0), int(limit))
-        top = (f"🧠 {C_GREY}ctx{R} {bar_s} {usage_color(pct)}{BOLD}{pct:.0f}%{R} "
+        top = (f"{C_GREY}ctx{R} {bar_s} {usage_color(pct)}{BOLD}{pct:.0f}%{R} "
                f"{C_GREY}({fmt_tokens(total_in)}/{fmt_tokens(limit)}){R}")
         # разбор внизу растягиваем ровно на ширину строки контекста сверху
         columns.append((top, justify(items, vis_width(top))))
 
+    # --- счётчик /compact в этой сессии ---
+    cmp_n = compact_count(data.get("transcript_path"), data.get("session_id"))
+    if cmp_n is not None:
+        warn_compact_limit(data.get("session_id"), cmp_n)
+        cmp_color = C_BAD if cmp_n >= COMPACT_LIMIT else (C_WARN if cmp_n else C_GREY)
+        columns.append((f"{C_GREY}cmp{R} {cmp_color}{BOLD}{cmp_n}/{COMPACT_LIMIT}{R}", ""))
+
     # --- деньги: в самом конце первой строки ---
     cost = (data.get("cost") or {}).get("total_cost_usd")
     if cost:
-        columns.append((f"💰 {C_COST}${cost:.2f}{R}", ""))
+        columns.append((f"{C_COST}${cost:.2f}{R}", ""))
 
     tops, bottoms = [], []
     for top, bottom in columns:
@@ -335,7 +408,9 @@ def main():
 
     line1 = SEP.join(tops).rstrip()
     line2 = SEP.join(bottoms).rstrip()
-    sys.stdout.write(line1 + ("\n" + line2 if line2.strip() else ""))
+    CLEAR_EOL = "\033[K"  # затираем хвост предыдущего, более длинного рендера
+    sys.stdout.write(line1 + CLEAR_EOL
+                      + (("\n" + line2 + CLEAR_EOL) if line2.strip() else ""))
 
 
 if __name__ == "__main__":
